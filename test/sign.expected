@@ -3,20 +3,20 @@
 #   !-prefixed  -- this text must NOT appear
 #
 # MLIR's printer renumbers SSA values, so pin each check to the operation text
-# rather than to the names in zero.mlir.  Regenerate with ./run.sh after adding
+# rather than to the names in Sign.mlir.  Regenerate with ./run.sh after adding
 # or reordering operations.
 
 # --- rule 1: constants ----------------------------------------------------
-llvm.mlir.constant(0 : i32) : i32 // %0 is zero
-llvm.mlir.constant(1 : i32) : i32 // %1 is nonzero
+llvm.mlir.constant(0 : i32) : i32 // %0 is Sign
+llvm.mlir.constant(1 : i32) : i32 // %1 is nonSign
 
-# --- rule 2: `and` with a zero operand, and facts chaining through it ------
-llvm.and %0, %arg0 : i32 // %2 is zero
-llvm.and %arg0, %0 : i32 // %3 is zero
-llvm.and %2, %arg0 : i32 // %4 is zero
+# --- rule 2: `and` with a Sign operand, and facts chaining through it ------
+llvm.and %0, %arg0 : i32 // %2 is Sign
+llvm.and %arg0, %0 : i32 // %3 is Sign
+llvm.and %2, %arg0 : i32 // %4 is Sign
 
 # --- the solver joining facts at a block argument -------------------------
-// argument: %2 is zero
+// argument: %2 is Sign
 
 # --- soundness: these must stay unknown -----------------------------------
 # %5 = 1 & 1, since 1 & 2 is 0; %6 and %7 have no rule; %8 uses an argument.
