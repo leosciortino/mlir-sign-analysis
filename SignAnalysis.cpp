@@ -1,17 +1,3 @@
-//===- SignAnalysis.cpp - Transfer functions ------------------------------===//
-//
-// The transfer function: given what is known about an operation's operands,
-// state what is known about its results.  This file and SignDomain.h are the
-// two to replace when building a different analysis; the rest of the project
-// is scaffolding.
-//
-// There are deliberately only two rules here, one of each kind an analysis
-// needs: one that introduces facts out of nothing (constants), and one that
-// propagates facts it was given (`and`).  Everything else is unknown.  Adding
-// a third rule should be a matter of adding a third `if`.
-//
-//===----------------------------------------------------------------------===//
-
 #include "SignAnalysis.h"
 
 #include "SignDomain.h"
@@ -24,14 +10,144 @@ using namespace mlir;
 namespace Sign {
 
 static SignState evalAdd(SignState lhs, SignState rhs);
-static SignState evalNeg(SignState state);
+static SignState evalSub(SignState lhs, SignState rhs);
+static SignState evalMul(SignState lhs, SignState rhs);
+static SignState evalDiv(SignState lhs, SignState rhs);
+static SignState evalGt(SignState lhs, SignState rhs);
+static SignState evalEq(SignState lhs, SignState rhs);
 void SignAnalysis::setToEntryState(SignLattice *lattice) {
   propagateIfChanged(lattice, lattice->join(SignState::top()));
 }
 
+// The row and column order is the order of Kind in SignDomain.h:
+// Bottom, Negative, Zero, Positive, One, ZeroNegative, ZeroPositive, Top.
+// Addition is commutative, so this table is symmetric.
 static constexpr Kind addTable[8][8] = {
-{Kind::Bottom, Kind::Bottom, Kind::Bottom, Kind::Bottom, Kind::Bottom, Kind::Bottom, Kind::Bottom, Kind::Bottom}
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Negative,      Kind::Negative,      Kind::Top,
+                        Kind::ZeroNegative, Kind::Negative,      Kind::Top,           Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::Negative,      Kind::Zero,          Kind::Positive,
+                        Kind::One,          Kind::ZeroNegative,  Kind::ZeroPositive,  Kind::Top},
+    /* Positive */     {Kind::Bottom,       Kind::Top,           Kind::Positive,      Kind::Positive,
+                        Kind::Positive,     Kind::Top,           Kind::Positive,      Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::ZeroNegative,  Kind::One,           Kind::Positive,
+                        Kind::Positive,     Kind::Top,           Kind::Positive,      Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::Negative,      Kind::ZeroNegative,  Kind::Top,
+                        Kind::Top,          Kind::ZeroNegative,  Kind::Top,           Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::Top,           Kind::ZeroPositive,  Kind::Positive,
+                        Kind::Positive,     Kind::Top,           Kind::ZeroPositive,  Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
 };
+
+static constexpr Kind subTable[8][8] = {
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Top,           Kind::Negative,      Kind::Negative,
+                        Kind::Negative,     Kind::Top,           Kind::Negative,      Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::Positive,      Kind::Zero,          Kind::Negative,
+                        Kind::Negative,     Kind::ZeroPositive,  Kind::ZeroNegative,  Kind::Top},
+    /* Positive */     {Kind::Bottom,       Kind::Positive,      Kind::Positive,      Kind::Top,
+                        Kind::ZeroPositive, Kind::Positive,      Kind::Top,           Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::Positive,      Kind::One,           Kind::ZeroNegative,
+                        Kind::Zero,         Kind::Positive,      Kind::Top,           Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::Top,           Kind::ZeroNegative,  Kind::Negative,
+                        Kind::Negative,     Kind::Top,           Kind::ZeroNegative,  Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::Positive,      Kind::ZeroPositive,  Kind::Top,
+                        Kind::Top,          Kind::ZeroPositive,  Kind::Top,           Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+};
+
+static constexpr Kind mulTable[8][8] = {
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Positive,      Kind::Zero,          Kind::Negative,
+                        Kind::Negative,     Kind::ZeroPositive,  Kind::ZeroNegative,  Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::Zero,          Kind::Zero,          Kind::Zero,
+                        Kind::Zero,         Kind::Zero,          Kind::Zero,          Kind::Zero},
+    /* Positive */     {Kind::Bottom,       Kind::Negative,      Kind::Zero,          Kind::Positive,
+                        Kind::Positive,     Kind::ZeroNegative,  Kind::ZeroPositive,  Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::Negative,      Kind::Zero,          Kind::Positive,
+                        Kind::One,          Kind::ZeroNegative,  Kind::ZeroPositive,  Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::ZeroPositive,  Kind::Zero,          Kind::ZeroNegative,
+                        Kind::ZeroNegative, Kind::ZeroPositive,  Kind::ZeroNegative,  Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::ZeroNegative,  Kind::Zero,          Kind::ZeroPositive,
+                        Kind::ZeroPositive, Kind::ZeroNegative,  Kind::ZeroPositive,  Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Zero,          Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+};
+
+static constexpr Kind divTable[8][8] = {
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Positive,      Kind::Bottom,        Kind::Negative,
+                        Kind::Negative,     Kind::Bottom,        Kind::Bottom,        Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::Zero,          Kind::Bottom,        Kind::Zero,
+                        Kind::Zero,         Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Positive */     {Kind::Bottom,       Kind::Negative,      Kind::Bottom,        Kind::Positive,
+                        Kind::Positive,     Kind::Bottom,        Kind::Bottom,        Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::Negative,      Kind::Bottom,        Kind::ZeroPositive,
+                        Kind::One,          Kind::Bottom,        Kind::Bottom,        Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::ZeroPositive,  Kind::Bottom,        Kind::ZeroNegative,
+                        Kind::ZeroNegative, Kind::Bottom,        Kind::Bottom,        Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::ZeroNegative,  Kind::Bottom,        Kind::ZeroPositive,
+                        Kind::ZeroPositive, Kind::Bottom,        Kind::Bottom,        Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Bottom,        Kind::Top,
+                        Kind::Top,          Kind::Bottom,        Kind::Bottom,        Kind::Top},
+};
+
+static constexpr Kind gtTable[8][8] = {
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Top,           Kind::Zero,          Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Zero,          Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::One,           Kind::Zero,          Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Top,           Kind::Top},
+    /* Positive */     {Kind::Bottom,       Kind::One,           Kind::One,           Kind::Top,
+                        Kind::Top,          Kind::One,           Kind::Top,           Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::One,           Kind::One,           Kind::Top,
+                        Kind::Zero,         Kind::One,           Kind::Top,           Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Zero,          Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::One,           Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+};
+
+static constexpr Kind eqTable[8][8] = {
+    //                  Bottom,             Negative,            Zero,                Positive
+    //                  One,                ZeroNegative,        ZeroPositive,        Top
+    /* Bottom */       {Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom,
+                        Kind::Bottom,       Kind::Bottom,        Kind::Bottom,        Kind::Bottom},
+    /* Negative */     {Kind::Bottom,       Kind::Top,           Kind::Zero,          Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Zero,          Kind::Top},
+    /* Zero */         {Kind::Bottom,       Kind::Zero,          Kind::One,           Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Top,           Kind::Top},
+    /* Positive */     {Kind::Bottom,       Kind::Zero,          Kind::Zero,          Kind::Top,
+                        Kind::Top,          Kind::Zero,          Kind::Top,           Kind::Top},
+    /* One */          {Kind::Bottom,       Kind::Zero,          Kind::Zero,          Kind::Top,
+                        Kind::One,          Kind::Zero,          Kind::Top,           Kind::Top},
+    /* ZeroNegative */ {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Zero,
+                        Kind::Zero,         Kind::Top,           Kind::Top,           Kind::Top},
+    /* ZeroPositive */ {Kind::Bottom,       Kind::Zero,          Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+    /* Top */          {Kind::Bottom,       Kind::Top,           Kind::Top,           Kind::Top,
+                        Kind::Top,          Kind::Top,           Kind::Top,           Kind::Top},
+};
+
 LogicalResult
 SignAnalysis::visitOperation(Operation *op,
                              ArrayRef<const SignLattice *> operands,
@@ -85,158 +201,80 @@ SignAnalysis::visitOperation(Operation *op,
     SignState lhs = operands[0]->getValue();
     SignState rhs = operands[1]->getValue();
 
-    // using a - b = a + (-b)
-    SignState tranfser_info = evalAdd(lhs, evalNeg(rhs));
+    SignState tranfser_info = evalSub(lhs, rhs);
     propagateIfChanged(result, result->join(tranfser_info));
     return success();
   }
 
+  if (isa<LLVM::MulOp>(op)) {
+    SignState lhs = operands[0]->getValue();
+    SignState rhs = operands[1]->getValue();
+
+    SignState tranfser_info = evalMul(lhs, rhs);
+    propagateIfChanged(result, result->join(tranfser_info));
+    return success();
+  }
+
+  if (isa<LLVM::SDivOp>(op)) {
+    SignState lhs = operands[0]->getValue();
+    SignState rhs = operands[1]->getValue();
+
+    SignState tranfser_info = evalDiv(lhs, rhs);
+    propagateIfChanged(result, result->join(tranfser_info));
+    return success();
+  }
+  if (auto cmp = dyn_cast<LLVM::ICmpOp>(op)) {
+    if (cmp.getPredicate() == LLVM::ICmpPredicate::sgt) {
+      SignState lhs = operands[0]->getValue();
+      SignState rhs = operands[1]->getValue();
+
+      SignState tranfser_info = evalGt(lhs, rhs);
+      propagateIfChanged(result, result->join(tranfser_info));
+      return success();
+    }
+
+    if (cmp.getPredicate() == LLVM::ICmpPredicate::eq) {
+      SignState lhs = operands[0]->getValue();
+      SignState rhs = operands[1]->getValue();
+
+      SignState tranfser_info = evalEq(lhs, rhs);
+      propagateIfChanged(result, result->join(tranfser_info));
+      return success();
+    }
+  }
+
+
   return unknown();
 }
 
-static bool check_symmetric(SignState lhs, SignState rhs,
-                           Kind first, Kind second) {
-  return (lhs.kind == first && rhs.kind == second) ||
-         (lhs.kind == second && rhs.kind == first);
-}
-
 static SignState evalAdd(SignState lhs, SignState rhs) {
-  if (lhs == Kind::Bottom || rhs == Kind::Bottom) {
-    return Kind::Bottom;
-  }
-  if (lhs == Kind::Top || rhs == Kind::Top) {
-    return Kind::Top;
-  }
-
-  // 1 + 1 = +
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::One)) {
-    return Kind::Positive;
-  }
-
-  //1 + + = +
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::Positive)) {
-    return Kind::Positive;
-  }
-
-  // 1 + 0 = 1
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::Zero)) {
-    return Kind::One;
-  }
-
-  // 1 + - = 0-
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::Negative)) {
-    return Kind::ZeroNegative;
-  }
-
-  // 1 + 0+ = +
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::ZeroPositive)) {
-    return Kind::Positive;
-  }
-
-  // 1 + 0- = top
-  if (check_symmetric(lhs, rhs, Kind::One, Kind::ZeroNegative)) {
-    return Kind::Top;
-  }
-
-  // + + +  = +
-  if (check_symmetric(lhs, rhs, Kind::Positive, Kind::Positive)) {
-    return Kind::Positive;
-  }
-
-  // + + 0 = +
-  if (check_symmetric(lhs, rhs, Kind::Positive, Kind::Zero)) {
-    return Kind::Positive;
-  }
-
-  // + + - = top
-  if (check_symmetric(lhs, rhs, Kind::Positive, Kind::Negative)) {
-    return Kind::Top;
-  }
-
-  // + + 0+ = +
-  if (check_symmetric(lhs, rhs, Kind::Positive, Kind::ZeroPositive)) {
-    return Kind::Positive;
-  }
-
-  // + + 0- = top
-  if (check_symmetric(lhs, rhs, Kind::Positive, Kind::ZeroNegative)) {
-    return Kind::Top;
-  }
-
-  // 0 + 0 = 0
-  if (check_symmetric(lhs, rhs, Kind::Zero, Kind::Zero)) {
-    return Kind::Zero;
-  }
-
-  // 0 + - = -
-  if (check_symmetric(lhs, rhs, Kind::Zero, Kind::Negative)) {
-    return Kind::Negative;
-  }
-
-  // 0 + 0+ = 0+
-  if (check_symmetric(lhs, rhs, Kind::Zero, Kind::ZeroPositive)) {
-    return Kind::ZeroPositive;
-  }
-
-  // 0 + 0- = 0-
-  if (check_symmetric(lhs, rhs, Kind::Zero, Kind::ZeroNegative)) {
-    return Kind::ZeroNegative;
-  }
-
-  // - + - = -
-  if (check_symmetric(lhs, rhs, Kind::Negative, Kind::Negative)) {
-    return Kind::Negative;
-  }
-
-  // - + 0+ = Top
-  if (check_symmetric(lhs, rhs, Kind::Negative, Kind::ZeroPositive)) {
-    return Kind::Top;
-  }
-
-  // - + 0- = -
-  if (check_symmetric(lhs, rhs, Kind::Negative, Kind::ZeroNegative)) {
-    return Kind::Negative;
-  }
-
-  // 0+ + 0+ = 0+
-  if (check_symmetric(lhs, rhs, Kind::ZeroPositive, Kind::ZeroPositive)) {
-    return Kind::ZeroPositive;
-  }
-
-  //0+ + 0- = top
-  if (check_symmetric(lhs, rhs, Kind::ZeroPositive, Kind::ZeroNegative)) {
-    return Kind::Top;
-  }
-
-  // 0- + 0- = 0-
-  if (check_symmetric(lhs, rhs, Kind::ZeroNegative, Kind::ZeroNegative)) {
-    return Kind::ZeroNegative;
-  }
-
-  return Kind::Top;
-
+  return addTable[static_cast<unsigned>(lhs.kind)]
+                 [static_cast<unsigned>(rhs.kind)];
 }
 
-static SignState evalNeg(SignState state) {
-  switch (state.kind) {
-  case Kind::Bottom:
-    return Kind::Bottom;
-  case Kind::Top:
-    return Kind::Top;
-  case Kind::Negative:
-    return Kind::Positive;
-  case Kind::Zero:
-    return Kind::Zero;
-  case Kind::Positive:
-    return Kind::Negative;
-  case Kind::One:
-    return Kind::Negative;
-  case Kind::ZeroNegative: // negative or zero
-    return Kind::ZeroPositive;
-  case Kind::ZeroPositive: // positive or zero
-    return Kind::ZeroNegative;
-  }
-
-  return Kind::Top;
+static SignState evalSub(SignState lhs, SignState rhs) {
+  return subTable[static_cast<unsigned>(lhs.kind)]
+                 [static_cast<unsigned>(rhs.kind)];
 }
+
+static SignState evalMul(SignState lhs, SignState rhs) {
+  return mulTable[static_cast<unsigned>(lhs.kind)]
+                 [static_cast<unsigned>(rhs.kind)];
+}
+
+static SignState evalDiv(SignState lhs, SignState rhs) {
+  return divTable[static_cast<unsigned>(lhs.kind)]
+                 [static_cast<unsigned>(rhs.kind)];
+}
+
+static SignState evalGt(SignState lhs, SignState rhs) {
+  return gtTable[static_cast<unsigned>(lhs.kind)]
+                [static_cast<unsigned>(rhs.kind)];
+}
+
+static SignState evalEq(SignState lhs, SignState rhs) {
+  return eqTable[static_cast<unsigned>(lhs.kind)]
+                [static_cast<unsigned>(rhs.kind)];
+}
+
 } // namespace Sign

@@ -1,21 +1,16 @@
 //===- SignDomain.h - The abstract domain ---------------------------------===//
 //
-// A four-point lattice recording whether an integer value is known to be Sign.
+// Extended Sign lattice
 //
-//        Top          nothing is known
-//       /   \
-//    Sign  NonSign
-//       \   /
-//       Bottom       unreachable, or not yet analyzed
-//
-// This is the file to replace first when building a different analysis.  MLIR's
-// dataflow framework asks only three things of a lattice value:
-//
-//   * a default constructor, which must produce the bottom element, because the
-//     solver starts every value optimistically and lowers it as facts arrive;
-//   * a static join(), which must be commutative, associative, idempotent, and
-//     monotone -- assertions in Lattice<> check monotonicity in debug builds;
-//   * operator== and print().
+//                         ⊤
+//                       /   \
+//                     0-     0+
+//                    /  \   /  \
+//                   -    0    +
+//                    \   |   |
+//                     \  |   1
+//                      \ |  /
+//                        ⊥
 //
 //===----------------------------------------------------------------------===//
 

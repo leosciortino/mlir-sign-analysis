@@ -1,39 +1,17 @@
-# MLIR out-of-tree dataflow analysis template
-
-A starting point for writing an MLIR dataflow analysis as a loadable `mlir-opt`
-plugin, with no LLVM source tree required and nothing to patch upstream.
-
-The included analysis, `Sign-analysis`, decides which integer values in the LLVM
-dialect are known to be Sign. It has exactly two transfer rules and is meant to
-be replaced: the point is the scaffolding around it.
+My project is a modified version of an analysis written by Prof. John Regehr and can be found here https://github.com/regehr/mlir-analysis-pass
 
 ## Building
 
 ```sh
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure
 ```
-
-That is the whole procedure on Linux, macOS, and WSL2. There is no platform
-flag to set and no path to edit. `CMakeLists.txt` finds MLIR by asking
-whichever `llvm-config` is on your `PATH` where its CMake package lives, so if
-`mlir-opt` runs, the build should configure.
 
 To build against a specific MLIR instead:
 
 ```sh
 cmake -S . -B build -DMLIR_DIR=/path/to/prefix/lib/cmake/mlir
 ```
-
-You need an LLVM built with MLIR enabled and plugins enabled
-(`-DLLVM_ENABLE_PROJECTS=mlir -DLLVM_ENABLE_PLUGINS=ON`; both are ordinary on
-Linux and macOS). Distribution packages work: on Debian and Ubuntu that is
-`libmlir-dev` alongside `llvm-dev`. On macOS, Homebrew's `llvm` is the easy
-route if it ships `mlir-opt` for your version; otherwise build LLVM yourself.
-The configure step diagnoses the cases it can detect — no MLIR
-found, plugins disabled in the host LLVM, or an `mlir-opt` on `PATH` whose
-version does not match what you are building against.
 
 ## Running
 
@@ -42,19 +20,7 @@ version does not match what you are building against.
 ```
 
 `run.sh` locates the plugin whatever it is called on your platform and puts the
-annotated listing on stdout. Or invoke `mlir-opt` yourself:
-
-```sh
-mlir-opt --load-pass-plugin=build/SignAnalysis.so \
-         --pass-pipeline='builtin.module(Sign-analysis)' \
-         input.mlir -o /dev/null
-```
-
-using `build/SignAnalysis.dylib` on macOS. The pass leaves the IR unchanged and
-writes it to stdout as usual; the annotated view goes to stderr, so the two
-streams can be redirected independently. Annotations are comments, so the
-annotated listing is still valid MLIR. Values at top or bottom are left
-unannotated, so that what prints is exactly what was proved.
+annotated listing on stdout.
 
 Get input in the LLVM dialect from C with:
 
@@ -62,97 +28,51 @@ Get input in the LLVM dialect from C with:
 clang -S -emit-llvm -o - input.c | mlir-translate --import-llvm
 ```
 
-## What is where
+## Sign lattice
+I implement the lattice from page 56 of Static Program Analysis by Anders Møller and Michael I. Schwartzbach.
 
-Two files hold the analysis; the rest is reusable scaffolding.
+                         ⊤
+                       /   \
+                     0-     0+
+                    /  \   /  \
+                   -    0    +
+                    \   |   |
+                     \  |   1
+                      \ |  /
+                        ⊥
 
-| File | |
-|---|---|
-| `SignDomain.h` | The abstract domain: the lattice elements and their join. |
-| `SignAnalysis.cpp` | The transfer function: two rules, plus a default. |
-| `SignAnalysis.h` | Ties the domain to MLIR's sparse forward analysis. |
-| `Annotate.{h,cpp}` | Prints IR with a comment on each value. Domain-agnostic. |
-| `Plugin.cpp` | The pass, the solver setup, and the `mlir-opt` entry point. |
-| `cmake/RunTest.cmake` | The test runner. |
+I implement 6 transfer functions: +, -, *, /, >, ==
 
-To build a different analysis, replace `SignDomain.h` and the transfer
-functions in `SignAnalysis.cpp`. To rename the whole thing, rename the files,
-the `Sign` namespace, and the three places `SignAnalysis` and `Sign-analysis`
-appear in `CMakeLists.txt` and `Plugin.cpp`.
+When compiling with clang -02 I do get interesting facts for +, *. The others seem to probably mostly being loaded values that can't be put as constants in the program.
 
-## Tests
+Here is an example of a cool fact that it found. on line 11082 of the output:
 
-`test/Sign.mlir` exercises every transfer rule. `test/Sign.expected` lists
-facts that must appear in the output, and — with a leading `!` — facts that
-must not. The negative checks are the ones that matter: an unsound transfer
-function still produces plausible-looking output, and only a test that pins
-down what the analysis must *not* claim will catch it.
+^bb10(%94: i32, %95: !llvm.ptr):  // 2 preds: ^bb9, ^bb10
+    // argument: %94 is ZeroPositive
+    %96 = llvm.load %95 {alignment = 8 : i64, tbaa = [#tbaa_tag265]} : !llvm.ptr -> !llvm.ptr
+    %97 = llvm.add %94, %0 : i32 // %97 is Positive
 
-Note that MLIR's printer renumbers SSA values, so the checks are written
-against operation text rather than the names in `Sign.mlir`. After adding or
-reordering operations, regenerate with `./run.sh test/Sign.mlir`.
+Where %0 is defined as one at the beginning of the function.
 
-## Notes on portability
+## Provided output
+The following files are provided
++ sqlite-amalgamation-3530400/sqlite3.c
++ sqlite-amalgamation-3530400/sqlite3.ll
++ sqlite-amalgamation-3530400/sqlite3.mlir
++ sqlite-amalgamation-3530400/sqlite3_analysis.out
 
-Most of the platform-specific knowledge lives in `CMakeLists.txt`, next to the
-code it affects. The parts worth knowing about:
+You can see in the analysis.out what the analysis concluded.
 
-**The plugin's file name differs.** It is `SignAnalysis.dylib` on macOS and
-`SignAnalysis.so` on Linux and WSL2. Nothing in this project spells that out:
-CMake is asked via `$<TARGET_FILE:SignAnalysis>`, and `run.sh` probes for both.
+## Running sqlite
+run the following to get the sqlite mlir, you may need to replace where your mac sdk is located if on linux you may not even need to include this flag.
+```sh
+clang -O2 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.0.sdk -S -emit-llvm -o - sqlite-amalgamation-3530400/sqlite3.c | mlir-translate --import-llvm > sqlite-amalgamation-3530400/sqlite3.mlir
+```
 
-**Linking a plugin on macOS needs special flags.** The plugin deliberately
-leaves its MLIR symbols undefined, to be resolved from the `mlir-opt` process
-that loads it. On macOS that requires `-undefined dynamic_lookup`, which
-`include(HandleLLVMOptions)` supplies. The same include also matches LLVM's
-RTTI and exception settings, which differ between distribution packages and
-local builds and cause link errors or silent ODR violations when they are
-wrong. That is also why `project()` enables C: `HandleLLVMOptions` probes flags
-with the C compiler and fails if none is configured.
+Then to run use 
+```sh
+./run.sh sqlite-amalgamation-3530400/sqlite3.mlir
+```
 
-**A plugin only loads into the LLVM it was built against.** The version is
-recorded at compile time and checked at load time, so a mismatch is a clear
-error rather than a crash. The configure step warns about it earlier still, by
-comparing against the `mlir-opt` it finds.
-
-**The test suite needs no shell.** `cmake/RunTest.cmake` is a CMake script
-rather than a shell script, so `ctest` depends on nothing the build did not
-already require.
-
-**Under WSL2, build on the Linux filesystem.** A tree under `/mnt/c` is
-slow enough to be noticeable and does not reliably carry execute bits.
-`.gitattributes` forces LF endings, which keeps `run.sh` working when a
-repository is cloned by a Windows git and built inside WSL2.
-
-## How the analysis works
-
-`Plugin.cpp` loads three analyses into one solver. `DeadCodeAnalysis` supplies
-reachability — without it the solver must assume every branch is taken — and
-`SparseConstantPropagation` resolves branch conditions on its behalf. These are
-prerequisites for a precise result, not optional extras. `SignAnalysis` then
-propagates Signness through operations and block arguments until the solver
-reaches a fixed point, which is when the pass queries it.
-
-The transfer function has two rules, one of each kind an analysis needs:
-
-- **Constants** are Sign or nonSign as written. This is the only rule that does
-  not consult its operands, and without some rule of this kind there would be
-  no facts to propagate at all.
-- **`x & y` is Sign if either operand is Sign**, because a Sign operand clears
-  every bit. Note what this does not say: two nonSign operands prove nothing,
-  since `1 & 2` is `0`.
-
-Everything else is unknown. That is always sound, just imprecise — `llvm.or`
-and `llvm.add` are left unhandled in the test file precisely so their output
-shows what "unknown" looks like. Adding a third rule should be a matter of
-adding a third `if`.
-
-Values reaching the analysis from outside — function arguments, and results of
-any operation without a rule — start at top. The domain's fourth element,
-bottom, means "not yet proved reachable"; the solver starts everything there
-and raises it as facts arrive, which is what makes the fixed-point iteration
-terminate.
-
-The analysis is intraprocedural. It does not refine facts on branch conditions,
-so a value tested against Sign is not known nonSign on the taken edge — that,
-and a rule for `llvm.or`, are the natural first extensions.
+## Sanity Checks
+The mlir in the sanity-checks directory is code that codex wrote that helped me test as I went.
