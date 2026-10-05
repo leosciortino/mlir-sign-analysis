@@ -1,0 +1,1 @@
+For some reason the reduce takes forever and I don't get output
